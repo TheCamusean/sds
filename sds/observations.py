@@ -465,13 +465,16 @@ class AutoRegressiveGaussianObservation:
 
 class RotAutoRegressiveGaussianObservation:
 
-    def __init__(self, nb_states, dm_obs, n_rot, dm_act=0, reg=1e-8):
+    def __init__(self, nb_states, dm_obs, n_rot, prior, dm_act=0, reg=1e-8):
         self.nb_states = nb_states
         self.nb_lds = int(nb_states/n_rot)
         self.dm_obs = dm_obs
         self.dm_act = dm_act
         self.reg = reg
         self.n_rot = n_rot
+
+        self.prior = prior
+
 
         self.rot_lds = np.zeros([self.nb_states,2])
         z = 0
@@ -654,7 +657,10 @@ class RotAutoRegressiveGaussianObservation:
                 x_k.append(x_)
                 w_k.append(w_)
 
-            coef_, intercept_, sigma = linear_regression(x_k, y_k,weights=w_k, nu0=0, Psi0=0, sigmasq0=1, fit_intercept=True)
+            coef_, intercept_, sigma = linear_regression(Xs = x_k, ys = y_k,
+            weights = w_k, fit_intercept = True,
+            **self.prior)
+
             self.A[k, ...] = coef_
             self.c[k, :] = intercept_
             self.cov[k, ...] = sigma

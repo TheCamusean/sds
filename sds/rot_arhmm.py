@@ -12,7 +12,7 @@ class ROT_ARHMM(HMM):
     def __init__(self, nb_states, dm_obs, n_rot, dm_act=0,
                  init_state_prior={}, init_obs_prior={}, trans_prior={}, obs_prior={},
                  init_state_kwargs={}, init_obs_kwargs={}, trans_kwargs={}, obs_kwargs={}):
-        self.init_obs_prior = init_obs_prior
+        #self.init_obs_prior = init_obs_prior
         self.nb_states = nb_states*n_rot
         super(ROT_ARHMM, self).__init__(self.nb_states, dm_obs,  dm_act,
                                         init_state_prior=init_state_prior, trans_prior=trans_prior,
@@ -20,9 +20,10 @@ class ROT_ARHMM(HMM):
                                         )
         self.n_rot = n_rot
 
-        self.init_observation = GaussianObservation(self.nb_states, self.dm_obs, self.dm_act
+        self.init_observation = GaussianObservation(self.nb_states, self.dm_obs, self.dm_act,
                                                     prior=init_obs_prior, **init_obs_kwargs)
-        self.observations = RotAutoRegressiveGaussianObservation(self.nb_states, self.dm_obs, self.n_rot, self.dm_act)
+        self.observations = RotAutoRegressiveGaussianObservation(self.nb_states, self.dm_obs, self.n_rot,
+                                                                 prior=obs_prior, **obs_kwargs)
 
     @ensure_args_are_viable_lists
     def initialize(self, obs, act=None, **kwargs):
