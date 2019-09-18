@@ -461,3 +461,258 @@ class AutoRegressiveGaussianObservation:
                 _mu[:, k, :] = self.mean(k, _x[:-1, :], _u[:-1, :self.dm_act])
             mean.append(np.einsum('nk,nkl->nl', _gamma[1:, ...], _mu))
         return mean
+
+
+class RotAutoRegressiveGaussianObservation:
+
+    def __init__(self, nb_states, dm_obs, n_rot, dm_act=0, reg=1e-8):
+        self.nb_states = nb_states
+        self.nb_lds = int(nb_states/n_rot)
+        self.dm_obs = dm_obs
+        self.dm_act = dm_act
+        self.reg = reg
+        self.n_rot = n_rot
+
+        self.rot_lds = np.zeros([self.nb_states,2])
+        z = 0
+        for i in range(self.nb_lds):
+            for j in range(self.n_rot):
+                self.rot_lds[z,0] = int(i)
+                self.rot_lds[z,1] = int(j)
+                z+=1
+
+        self.A = np.zeros((self.nb_lds, self.dm_obs, self.dm_obs))
+        self.B = np.zeros((self.nb_lds, self.dm_obs, self.dm_act))
+        self.c = np.zeros((self.nb_lds, self.dm_obs))
+
+        for k in range(self.nb_lds):
+            self.A[k, ...] = .95 * random_rotation(self.dm_obs)
+            self.B[k, ...] = npr.randn(self.dm_obs, self.dm_act)
+            self.c[k, :]   = npr.randn(self.dm_obs)
+
+        self.T = np.zeros((self.n_rot, self.dm_obs, self.dm_obs))
+        self.T_inv = np.zeros((self.n_rot, self.dm_obs, self.dm_obs))
+
+        for k in range(self.n_rot):
+            #self.T[k, ...] = .95 * random_rotation(self.dm_obs)
+            self.T[k, ...] = np.array([[1,0],[0,1]])
+            #self.T[k, ...] = np.array([[0, -1], [1, 0]])
+            self.T_inv[k, ...] = np.linalg.inv(self.T[k, ...])
+
+        self._sqrt_cov = npr.randn(self.nb_lds, self.dm_obs, self.dm_obs)
+
+    @property
+    def cov(self):
+        return np.matmul(self._sqrt_cov, np.swapaxes(self._sqrt_cov, -1, -2))
+
+    @cov.setter
+    def cov(self, value):
+        self._sqrt_cov = np.linalg.cholesky(value + self.reg * np.eye(self.dm_obs))
+
+    def initialize(self, x, u, **kwargs):
+        localize = kwargs.get('localize', False)
+
+        Ts = [_x.shape[0] for _x in x]
+        if localize:
+            from sklearn.cluster import KMeans
+            km = KMeans(self.nb_states, random_state=1)
+            km.fit((np.vstack(x)))
+            zs = np.split(km.labels_, np.cumsum(Ts)[:-1])
+            zs = [z[:-1] for z in zs]
+        else:
+            zs = [npr.choice(self.nb_states, size=T - 1) for T in Ts]
+
+        _cov = np.zeros((self.nb_states, self.dm_obs, self.dm_obs))
+        for k in range(self.nb_states):
+            ## Select the transformation
+            si = int(self.rot_lds[k,0])
+            sj = int(self.rot_lds[k,1])
+            T = self.T[sj, ...]
+
+            ts = [np.where(z == k)[0] for z in zs]
+
+            xs = []
+            ys = []
+            for i in range(len(ts)):
+                _x =x[i][ts[i],:]
+                _x = np.dot(T,_x.T).T
+                _y =x[i][ts[i]+1,:]
+                _y = np.dot(T,_y.T).T
+
+                xs.append(_x)
+                ys.append(_y)
+
+            ## THIS SHOULD NOT BE LIKE THIS , DUE TO IF SEVERAL TRANSFORMATIONS NOT WORK
+            coef_, intercept_, sigma = linear_regression(xs, ys)
+            self.A[si, ...] = coef_[:, :self.dm_obs]
+            #self.B[k, ...] = coef_[:, self.dm_obs:]
+            self.c[si, :] = intercept_
+            _cov[si, ...] = sigma
+
+            self.cov = _cov
+
+        self.covt = np.zeros([self.nb_states,self.dm_obs,self.dm_obs])
+        for k in range(self.nb_states):
+            i = int(self.rot_lds[k, 0])
+            j = int(self.rot_lds[k, 1])
+            T_inv = self.T_inv[j, ...]
+            self.covt[k, ...] = np.dot(T_inv,self.cov[i, ...])
+
+    # vectorized in x and u only
+    def mean(self, z, x, u):
+        A, c, T, T_inv = self.get_rot_lds(z)
+        x = np.einsum('kh,...h->...k', T, x)
+        xt = np.einsum('kh,...h->...k', A, x) + c
+        return np.einsum('kh,...h->...k', T_inv, xt)
+        #return xt
+
+    def get_rot_lds(self,z):
+        zi = int(self.rot_lds[z,0])
+        zj = int(self.rot_lds[z,1])
+
+        A = self.A[zi, ...]
+        c = self.c[zi, ...]
+        T = self.T[zj, ...]
+        T_inv = self.T_inv[zj, ...]
+        return A, c, T, T_inv
+
+    # one sample at a time
+    def sample(self, z, x, u, stoch=False):
+        mu = self.mean(z, x, u)
+        j = int(self.rot_lds[z, 1])
+        T_inv = self.T_inv[j, ...]
+        T = self.T[j, ...]
+        mu = np.einsum('kh,...h->...k', T, mu)
+
+        if stoch:
+            Hsample = mvn(mu, cov=self.cov[z, ...]).rvs()
+            #return mvn(mu, cov=self.cov[z, ...]).rvs()
+        else:
+            Hsample = mu
+            #return mu
+        return np.einsum('kh,...h->...k', T_inv, Hsample)
+        #return Hsample
+
+    def log_likelihood(self, x, u):
+        loglik = []
+        for _x, _u in zip(x, u):
+            T = _x.shape[0]
+            _loglik = np.zeros((T - 1, self.nb_states))
+            for k in range(self.nb_states):
+                _mu = self.mean(k, _x[:-1, :], _u[:-1, :self.dm_act])
+                j = int(self.rot_lds[k, 1])
+                i = int(self.rot_lds[k, 0])
+                T_inv = self.T_inv[j, ...]
+                T = self.T[j, ...]
+
+                _mu = np.einsum('kh,...h->...k', T, _mu)
+                _x_t = np.einsum('kh,...h->...k', T, _x[1:, :])
+                #_x_t = _x[1:, :]
+                _loglik[:, k] = multivariate_normal_logpdf(_x_t, _mu, self.cov[i, ...])
+
+            loglik.append(_loglik)
+        return loglik
+
+    def log_prior(self):
+        return 0.0
+
+    def permute(self, perm):
+        self.A = self.A[perm, ...]
+        self.B = self.B[perm, ...]
+        self.c = self.c[perm, :]
+        self._sqrt_cov = self._sqrt_cov[perm, ...]
+
+    def mstep(self, gamma, x, u):
+        xs, ys, ws = [], [], []
+        for _x, _u, _w in zip(x, u, gamma):
+            #xs.append(np.hstack((_x[:-1, :], _u[:-1, :self.dm_act], np.ones((_x.shape[0] - 1, 1)))))
+            xs.append(_x[:-1, :])
+            ys.append(_x[1:, :])
+            ws.append(_w[1:, :])
+
+        _J_diag = np.concatenate((self.reg * np.ones(self.dm_obs),
+                                  self.reg * np.ones(self.dm_act),
+                                  self.reg * np.ones(1)))
+        _J = np.tile(np.diag(_J_diag)[None, :, :], (self.nb_lds, 1, 1))
+        _h = np.zeros((self.nb_lds, self.dm_obs + self.dm_act + 1, self.dm_obs))
+
+        for k in range(self.nb_states):
+            x_k = []
+            y_k = []
+            w_k = []
+            Hx_k = []
+            for _x, _y, _w in zip(xs, ys, ws):
+                i= int(self.rot_lds[k,0])
+                j= int(self.rot_lds[k,1])
+                ## Transformation Matrix
+                T = self.T[j, ...]
+                x_ = np.einsum('kh,...h->...k', T, _x)
+                y_ = np.einsum('kh,...h->...k', T, _y)
+                w_ = _w[:, k]
+
+                y_k.append(y_)
+                x_k.append(x_)
+                w_k.append(w_)
+
+            coef_, intercept_, sigma = linear_regression(x_k, y_k,weights=w_k, nu0=0, Psi0=0, sigmasq0=1, fit_intercept=True)
+            self.A[k, ...] = coef_
+            self.c[k, :] = intercept_
+            self.cov[k, ...] = sigma
+
+            # mu = np.linalg.solve(_J, _h)
+            # self.A = np.swapaxes(mu[:, :self.dm_obs, :], 1, 2) #Transpose because we computed by (wx)' x'A' = (wx)'y'
+            # self.B = np.swapaxes(mu[:, self.dm_obs:self.dm_obs + self.dm_act, :], 1, 2)
+            # self.c = mu[:, -1, :]
+
+        # sqerr = np.zeros((self.nb_states, self.dm_obs, self.dm_obs))
+        # weight = self.reg * np.ones(self.nb_states)
+        #
+        # ## This should be done in order to learn the parameters with respect to number of linear functions
+        # for _x, _y, _w in zip(xs, ys, ws):
+        #     _yext = np.zeros([self.nb_states,_y.shape[0],_y.shape[1]])
+        #     yhat = np.zeros([self.nb_states,_y.shape[0],_y.shape[1]])
+        #     for k in range(self.nb_states):
+        #         i = int(self.rot_lds[k, 0])
+        #         j = int(self.rot_lds[k, 1])
+        #         T = self.T[j, ...]
+        #         T_inv = self.T_inv[j, ...]
+        #         Hx = np.dot(T,_x[:,:self.dm_obs].T).T
+        #
+        #         _x[:, :self.dm_obs] = Hx
+        #         mu_i = mu[i, ...]
+        #         Hy = np.dot(_x,mu_i)
+        #         ## Considero que deberia de ser mu_i * X o sino en el sample meter alreves.
+        #         #Hy = np.einsum('kh,...h->...k', self.A[i, ...], Hx) + self.c[i, ...]
+        #
+        #
+        #         yhat[k, ...] = Hy
+        #         _yext[k, ...] = np.dot(T, _y.T).T
+        #     #yhat = np.matmul(_x[None, :, :], mu)
+        #     resid = _yext - yhat
+        #     sqerr += np.einsum('tk,kti,ktj->kij', _w, resid, resid)
+        #     weight += np.sum(_w, axis=0)
+        #
+        # _cov = sqerr / weight[:, None, None]
+        #
+        # usage = sum([_gamma.sum(0) for _gamma in gamma])
+        # unused = np.where(usage < 1)[0]
+        # used = np.where(usage > 1)[0]
+        # if len(unused) > 0:
+        #     for k in unused:
+        #         i = npr.choice(used)
+        #         self.A[k] = self.A[i] + 0.01 * npr.randn(*self.A[i].shape)
+        #         self.B[k] = self.B[i] + 0.01 * npr.randn(*self.B[i].shape)
+        #         self.c[k] = self.c[i] + 0.01 * npr.randn(*self.c[i].shape)
+        #         _cov[k] = _cov[i]
+        #
+        # self.cov = _cov
+
+    def smooth(self, gamma, x, u):
+        mean = []
+        for _x, _u, _gamma in zip(x, u, gamma):
+            _mu = np.zeros((len(_x) - 1, self.nb_states, self.dm_obs))
+            for k in range(self.nb_states):
+                _mu[:, k, :] = self.mean(k, _x[:-1, :], _u[:-1, :self.dm_act])
+            mean.append(np.einsum('nk,nkl->nl', _gamma[1:, ...], _mu))
+        return mean
+
